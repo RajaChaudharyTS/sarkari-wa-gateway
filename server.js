@@ -40,7 +40,7 @@ async function connectToWhatsApp() {
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: 'silent' }),
-            browser: Browsers.macOS('Desktop'),
+            browser: Browsers.windows('Chrome'),
             syncFullHistory: false,
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 25000
