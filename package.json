@@ -1,0 +1,19 @@
+{
+  "name": "sarkari-wa-gateway",
+  "version": "1.0.0",
+  "description": "Private Cloud WhatsApp Web Gateway for Sarkari Alerts",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pino": "^9.0.0",
+    "qrcode": "^1.5.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
