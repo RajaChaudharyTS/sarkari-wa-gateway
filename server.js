@@ -1,5 +1,13 @@
 const express = require('express');
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, Browsers, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { 
+    default: makeWASocket, 
+    DisconnectReason, 
+    useMultiFileAuthState, 
+    Browsers, 
+    fetchLatestBaileysVersion, 
+    proto,
+    generateMessageIDV2
+} = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const pino = require('pino');
 const fs = require('fs');
@@ -9,9 +17,10 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET || 'sarkari_secret_token_2026';
 const TARGET_JID = process.env.WHATSAPP_TARGET_JID || '120363429584632967@newsletter';
+const CF_WORKER_URL = process.env.CF_WORKER_URL || 'https://sarkari-jobs-alert-bot.rajachaudharyts.workers.dev';
 const AUTH_DIR = path.join(__dirname, 'auth_session');
 
 let sock = null;
@@ -27,10 +36,72 @@ if (!fs.existsSync(AUTH_DIR)) {
 }
 
 /**
+ * Cloudflare KV Session Sync
+ */
+async function restoreSessionFromCloud() {
+    try {
+        console.log('🔄 Checking Cloudflare KV for saved session backup...');
+        const res = await fetch(`${CF_WORKER_URL}/api/wa-auth`, {
+            headers: { 'Authorization': `Bearer ${GATEWAY_SECRET}` }
+        });
+        if (res.ok) {
+            const data = await res.json();
+            if (data && data.creds) {
+                console.log('📦 Found saved session in Cloudflare KV! Restoring to disk...');
+                fs.writeFileSync(path.join(AUTH_DIR, 'creds.json'), JSON.stringify(data.creds, null, 2));
+                if (data.keys) {
+                    for (const [k, v] of Object.entries(data.keys)) {
+                        fs.writeFileSync(path.join(AUTH_DIR, k), typeof v === 'string' ? v : JSON.stringify(v));
+                    }
+                }
+                console.log('✅ Session restored from Cloudflare KV!');
+                return true;
+            }
+        }
+    } catch (e) {
+        console.log('Note: Cloudflare KV session restore skipped:', e.message);
+    }
+    return false;
+}
+
+async function backupSessionToCloud() {
+    try {
+        const credsFile = path.join(AUTH_DIR, 'creds.json');
+        if (!fs.existsSync(credsFile)) return;
+        const creds = JSON.parse(fs.readFileSync(credsFile, 'utf8'));
+        
+        const files = fs.readdirSync(AUTH_DIR);
+        const keys = {};
+        for (const file of files) {
+            if (file !== 'creds.json') {
+                keys[file] = fs.readFileSync(path.join(AUTH_DIR, file), 'utf8');
+            }
+        }
+
+        await fetch(`${CF_WORKER_URL}/api/wa-auth`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${GATEWAY_SECRET}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ creds, keys })
+        });
+        console.log('☁️ WhatsApp session backed up to Cloudflare KV!');
+    } catch (e) {
+        console.log('Cloud session backup error:', e.message);
+    }
+}
+
+/**
  * Initializes Baileys WhatsApp Connection
  */
 async function connectToWhatsApp() {
     try {
+        // Try restoring session from Cloudflare KV if local auth is empty
+        if (!fs.existsSync(path.join(AUTH_DIR, 'creds.json'))) {
+            await restoreSessionFromCloud();
+        }
+
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
         const { version, isLatest } = await fetchLatestBaileysVersion();
         console.log(`📡 WhatsApp Web Version: ${version.join('.')} (Latest: ${isLatest})`);
@@ -39,14 +110,18 @@ async function connectToWhatsApp() {
             version,
             auth: state,
             printQRInTerminal: false,
-            logger: pino({ level: 'silent' }),
+            logger: pino({ level: 'info' }),
             browser: Browsers.windows('Chrome'),
             syncFullHistory: false,
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 25000
         });
 
-        sock.ev.on('creds.update', saveCreds);
+        sock.ev.on('creds.update', async () => {
+            await saveCreds();
+            // Automatically backup to Cloudflare KV when credentials update
+            await backupSessionToCloud();
+        });
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
@@ -76,7 +151,7 @@ async function connectToWhatsApp() {
                 if (shouldReconnect) {
                     setTimeout(connectToWhatsApp, 5000);
                 } else {
-                    console.log('❌ WhatsApp Logged Out! Clearing auth session...');
+                    console.log('❌ WhatsApp Logged Out! Resetting auth session...');
                     try {
                         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                     } catch (e) {}
@@ -92,6 +167,21 @@ async function connectToWhatsApp() {
                 console.log(`🎉 WHATSAPP CONNECTED! User: ${sock.user?.id || 'Unknown'}`);
                 console.log(`📢 Default Target Channel JID: ${TARGET_JID}`);
                 console.log('====================================================');
+
+                // Try auto-subscribing to default channel
+                if (TARGET_JID) {
+                    try {
+                        if (typeof sock.subscribeNewsletterUpdates === 'function') {
+                            await sock.subscribeNewsletterUpdates(TARGET_JID);
+                            console.log(`✅ Subscribed to newsletter updates: ${TARGET_JID}`);
+                        }
+                    } catch (e) {
+                        console.log('Newsletter subscribe note:', e.message);
+                    }
+                }
+
+                // Trigger a cloud backup of the fresh valid session
+                setTimeout(backupSessionToCloud, 2000);
             }
         });
 
@@ -118,7 +208,6 @@ app.get('/', (req, res) => {
     });
 });
 
-// 2. Status API for Cloudflare Worker Heartbeat
 app.get('/status', (req, res) => {
     res.json({
         online: true,
@@ -129,7 +218,7 @@ app.get('/status', (req, res) => {
     });
 });
 
-// 3. Web UI to view & scan QR Code
+// 2. Web UI to view & scan QR Code
 app.get('/qr', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -153,21 +242,16 @@ app.get('/qr', (req, res) => {
             .badge.connected { background: #16a34a; color: #dcfce7; }
             .dot { width: 10px; height: 10px; border-radius: 50%; background: currentColor; animation: pulse 1.5s infinite; }
             @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
-            .btn { background: #38bdf8; color: #0f172a; border: none; padding: 12px 24px; border-radius: 10px; font-weight: bold; cursor: pointer; text-decoration: none; display: inline-block; margin-top: 15px; }
-            .btn:hover { background: #7dd3fc; }
         </style>
         <script>
-            // Auto reload every 5 seconds until connected
             setInterval(() => {
                 fetch('/status')
                     .then(res => res.json())
                     .then(data => {
-                        if (data.connected) {
-                            location.reload();
-                        }
+                        if (data.connected) location.reload();
                     })
                     .catch(() => {});
-            }, 4000);
+            }, 3000);
         </script>
     </head>
     <body>
@@ -185,7 +269,7 @@ app.get('/qr', (req, res) => {
                     <p style="color: #94a3b8; font-size: 14px;">Connected Number: <b>${connectedUser?.id || 'Active Phone'}</b></p>
                     <p style="color: #94a3b8; font-size: 14px; margin-top: 6px;">Target Channel: <b>${TARGET_JID}</b></p>
                 </div>
-                <p style="font-size: 13px; color: #64748b; margin-top: 15px;">Your Cloudflare Worker will now send all Sarkari Job alerts through this session for free!</p>
+                <p style="font-size: 13px; color: #64748b; margin-top: 15px;">Permanent Cloud Automation is live!</p>
             ` : `
                 <div class="badge waiting">
                     <span class="dot"></span> Waiting for QR Code Scan...
@@ -205,7 +289,7 @@ app.get('/qr', (req, res) => {
                     <b>📲 Link your WhatsApp in 3 Easy Steps:</b>
                     <ol style="margin-top: 8px;">
                         <li>Open WhatsApp on your phone</li>
-                        <li>Tap <b>Menu (3 dots)</b> or <b>Settings</b> &rarr; <b>Linked Devices</b></li>
+                        <li>Tap <b>Menu (3 dots)</b> &rarr; <b>Linked Devices</b></li>
                         <li>Tap <b>Link a Device</b> and point your camera at this QR Code!</li>
                     </ol>
                 </div>
@@ -216,46 +300,41 @@ app.get('/qr', (req, res) => {
     `);
 });
 
-// 4. Request Phone Pairing Code (Alternative to QR)
-app.get('/pair', async (req, res) => {
-    const phone = req.query.phone;
-    if (!phone) {
-        return res.status(400).json({ error: 'Missing phone query parameter. Example: /pair?phone=919473128739' });
-    }
-    if (isConnected) {
-        return res.json({ message: 'WhatsApp is already connected!', user: connectedUser?.id });
-    }
-    if (!sock) {
-        return res.status(503).json({ error: 'Socket is not initialized yet. Try again in 3 seconds.' });
-    }
-
+// 3. Inspect channels owned or subscribed
+app.get('/newsletters', async (req, res) => {
+    if (!sock || !isConnected) return res.status(503).json({ error: 'Not connected' });
     try {
-        const cleanPhone = phone.replace(/[^0-9]/g, '');
-        const code = await sock.requestPairingCode(cleanPhone);
-        res.json({
-            status: 'success',
-            phone: cleanPhone,
-            pairingCode: code,
-            instructions: 'In WhatsApp: Settings -> Linked Devices -> Link a Device -> Link with phone number instead'
-        });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+        let list = [];
+        if (typeof sock.newsletterSubscribed === 'function') {
+            list = await sock.newsletterSubscribed();
+        }
+        res.json({ count: list.length, newsletters: list });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
-// 5. Send Alert to Channel (Target of Cloudflare Worker)
+// 4. Query newsletter metadata by invite code
+app.get('/newsletter-meta', async (req, res) => {
+    if (!sock || !isConnected) return res.status(503).json({ error: 'Not connected' });
+    try {
+        const code = req.query.code || '0029VbDyzTz9RZAPvqZL7542';
+        const meta = await sock.newsletterMetadata('invite', code);
+        res.json(meta);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 5. Send Alert (Supports both Newsletters and Regular Chats)
 app.post('/send', async (req, res) => {
-    // Check Authorization Secret
     const authHeader = req.headers.authorization;
     if (GATEWAY_SECRET && (!authHeader || authHeader !== `Bearer ${GATEWAY_SECRET}`)) {
         return res.status(401).json({ error: 'Unauthorized: Invalid GATEWAY_SECRET' });
     }
 
     if (!isConnected || !sock) {
-        return res.status(503).json({
-            error: 'WhatsApp is not connected yet. Please visit /qr to scan QR code.',
-            connected: false
-        });
+        return res.status(503).json({ error: 'WhatsApp is not connected yet.' });
     }
 
     const { text, targetJid } = req.body;
@@ -264,29 +343,119 @@ app.post('/send', async (req, res) => {
     }
 
     const destination = targetJid || TARGET_JID;
+    console.log(`\n📨 [Outbound Request] Destination: ${destination}`);
 
+    // SPECIAL HANDLING FOR WHATSAPP NEWSLETTER (CHANNEL)
+    if (destination.endsWith('@newsletter')) {
+        let lastErr = null;
+
+        // Method 1: Direct XMPP Query with Plaintext Message
+        try {
+            console.log('Attempting Method 1 (Direct Plaintext Query)...');
+            const encoded = proto.Message.encode({ conversation: text }).finish();
+            const msgId = generateMessageIDV2(sock.user?.id);
+            const stanza = {
+                tag: 'message',
+                attrs: {
+                    to: destination,
+                    id: msgId,
+                    type: 'text'
+                },
+                content: [{
+                    tag: 'plaintext',
+                    attrs: {},
+                    content: encoded
+                }]
+            };
+
+            const queryRes = await sock.query(stanza);
+            console.log('✅ Method 1 Success:', JSON.stringify(queryRes));
+            return res.json({
+                status: 'success',
+                method: 'query_plaintext',
+                destination,
+                messageId: msgId,
+                response: queryRes
+            });
+        } catch (e1) {
+            console.log('Method 1 failed:', e1.message);
+            lastErr = e1;
+        }
+
+        // Method 2: High-Level sock.sendMessage
+        try {
+            console.log('Attempting Method 2 (High-level sendMessage)...');
+            const sendRes = await sock.sendMessage(destination, { text });
+            console.log('✅ Method 2 Success:', JSON.stringify(sendRes));
+            return res.json({
+                status: 'success',
+                method: 'sendMessage',
+                destination,
+                messageId: sendRes?.key?.id,
+                response: sendRes
+            });
+        } catch (e2) {
+            console.error('Method 2 failed:', e2.message);
+            lastErr = e2;
+        }
+
+        return res.status(500).json({
+            status: 'error',
+            destination,
+            error: lastErr?.message || 'All newsletter send methods failed'
+        });
+    }
+
+    // REGULAR CHAT / GROUP SEND
     try {
         const result = await sock.sendMessage(destination, { text });
-        console.log(`✅ [Alert Delivered] Sent to: ${destination}`);
+        console.log(`✅ [Direct Message Delivered] Sent to: ${destination}`);
         res.json({
             status: 'success',
             destination,
-            messageId: result?.key?.id,
-            timestamp: new Date().toISOString()
+            messageId: result?.key?.id
         });
     } catch (err) {
-        console.error('Failed to send WhatsApp alert:', err);
-        res.status(500).json({
-            status: 'error',
-            error: err.message,
-            destination
-        });
+        console.error('Direct message error:', err.message);
+        res.status(500).json({ status: 'error', error: err.message, destination });
+    }
+});
+
+// Quick Test Route
+app.get('/test-channel', async (req, res) => {
+    if (!isConnected || !sock) return res.status(503).json({ error: 'WhatsApp not connected' });
+    const text = req.query.text || '🟢 *Sarkari Result Test Post*\nAutomated channel verification test.';
+    try {
+        const encoded = proto.Message.encode({ conversation: text }).finish();
+        const msgId = generateMessageIDV2(sock.user?.id);
+        const stanza = {
+            tag: 'message',
+            attrs: {
+                to: TARGET_JID,
+                id: msgId,
+                type: 'text'
+            },
+            content: [{
+                tag: 'plaintext',
+                attrs: {},
+                content: encoded
+            }]
+        };
+        const queryRes = await sock.query(stanza);
+        res.json({ status: 'success', messageId: msgId, response: queryRes });
+    } catch (err) {
+        // Fallback to sendMessage
+        try {
+            const sendRes = await sock.sendMessage(TARGET_JID, { text });
+            res.json({ status: 'success_fallback', sendRes });
+        } catch (e) {
+            res.status(500).json({ error: err.message, fallbackError: e.message });
+        }
     }
 });
 
 // Start Server
 app.listen(PORT, () => {
     console.log(`🚀 Sarkari WhatsApp Gateway listening on port ${PORT}`);
-    console.log(`👉 Open http://localhost:${PORT}/qr to link WhatsApp`);
     connectToWhatsApp();
 });
