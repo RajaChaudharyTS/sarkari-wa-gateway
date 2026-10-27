@@ -337,21 +337,65 @@ app.post('/send', async (req, res) => {
         return res.status(503).json({ error: 'WhatsApp is not connected yet.' });
     }
 
-    const { text, targetJid } = req.body;
-    if (!text) {
-        return res.status(400).json({ error: 'Missing "text" in JSON body' });
+    const { text, targetJid, imageUrl } = req.body;
+    if (!text && !imageUrl) {
+        return res.status(400).json({ error: 'Missing "text" or "imageUrl" in JSON body' });
     }
 
     const destination = targetJid || TARGET_JID;
-    console.log(`\n📨 [Outbound Request] Destination: ${destination}`);
+    console.log(`\n📨 [Outbound Request] Destination: ${destination}, Has Image: ${!!imageUrl}`);
+
+    // If imageUrl is provided, attempt to download image into Buffer
+    let imageBuffer = null;
+    if (imageUrl) {
+        try {
+            console.log(`📥 Downloading image for WhatsApp: ${imageUrl}`);
+            const imgRes = await fetch(imageUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                }
+            });
+            if (imgRes.ok) {
+                const arrayBuf = await imgRes.arrayBuffer();
+                imageBuffer = Buffer.from(arrayBuf);
+                console.log(`✅ Image downloaded successfully (${imageBuffer.length} bytes)`);
+            } else {
+                console.warn(`Failed to download image (${imageUrl}): HTTP ${imgRes.status}`);
+            }
+        } catch (fetchErr) {
+            console.warn(`Error downloading image (${imageUrl}):`, fetchErr.message);
+        }
+    }
 
     // SPECIAL HANDLING FOR WHATSAPP NEWSLETTER (CHANNEL)
     if (destination.endsWith('@newsletter')) {
         let lastErr = null;
 
-        // Method 1: Direct XMPP Query with Plaintext Message
+        // Priority 1: If image is available, send as image message with caption
+        if (imageBuffer) {
+            try {
+                console.log('Attempting Newsletter Media Send (Image with caption)...');
+                const sendRes = await sock.sendMessage(destination, {
+                    image: imageBuffer,
+                    caption: text || ''
+                });
+                console.log('✅ Newsletter Image Message Success:', JSON.stringify(sendRes));
+                return res.json({
+                    status: 'success',
+                    method: 'newsletter_image',
+                    destination,
+                    messageId: sendRes?.key?.id,
+                    response: sendRes
+                });
+            } catch (imgErr) {
+                console.warn('Newsletter image send failed, falling back to plaintext:', imgErr.message);
+                lastErr = imgErr;
+            }
+        }
+
+        // Priority 2: Direct XMPP Query with Plaintext Message
         try {
-            console.log('Attempting Method 1 (Direct Plaintext Query)...');
+            console.log('Attempting Method 2 (Direct Plaintext Query)...');
             const encoded = proto.Message.encode({ conversation: text }).finish();
             const msgId = generateMessageIDV2(sock.user?.id);
             const stanza = {
@@ -369,7 +413,7 @@ app.post('/send', async (req, res) => {
             };
 
             const queryRes = await sock.query(stanza);
-            console.log('✅ Method 1 Success:', JSON.stringify(queryRes));
+            console.log('✅ Method 2 Success:', JSON.stringify(queryRes));
             return res.json({
                 status: 'success',
                 method: 'query_plaintext',
@@ -378,15 +422,15 @@ app.post('/send', async (req, res) => {
                 response: queryRes
             });
         } catch (e1) {
-            console.log('Method 1 failed:', e1.message);
+            console.log('Method 2 failed:', e1.message);
             lastErr = e1;
         }
 
-        // Method 2: High-Level sock.sendMessage
+        // Priority 3: High-Level sock.sendMessage (Text)
         try {
-            console.log('Attempting Method 2 (High-level sendMessage)...');
+            console.log('Attempting Method 3 (High-level sendMessage text)...');
             const sendRes = await sock.sendMessage(destination, { text });
-            console.log('✅ Method 2 Success:', JSON.stringify(sendRes));
+            console.log('✅ Method 3 Success:', JSON.stringify(sendRes));
             return res.json({
                 status: 'success',
                 method: 'sendMessage',
@@ -395,7 +439,7 @@ app.post('/send', async (req, res) => {
                 response: sendRes
             });
         } catch (e2) {
-            console.error('Method 2 failed:', e2.message);
+            console.error('Method 3 failed:', e2.message);
             lastErr = e2;
         }
 
@@ -408,7 +452,10 @@ app.post('/send', async (req, res) => {
 
     // REGULAR CHAT / GROUP SEND
     try {
-        const result = await sock.sendMessage(destination, { text });
+        const payload = imageBuffer 
+            ? { image: imageBuffer, caption: text || '' } 
+            : { text: text || '' };
+        const result = await sock.sendMessage(destination, payload);
         console.log(`✅ [Direct Message Delivered] Sent to: ${destination}`);
         res.json({
             status: 'success',
