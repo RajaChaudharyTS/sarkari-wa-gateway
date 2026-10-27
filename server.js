@@ -209,12 +209,20 @@ app.get('/', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
+    const mem = process.memoryUsage();
     res.json({
         online: true,
         connected: isConnected,
         user: connectedUser?.id || null,
         targetJid: TARGET_JID,
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        storageInfo: {
+            architecture: 'zero_media_storage',
+            imageStorageOnDisk: '0 KB (Transient RAM streaming direct to WhatsApp CDN)',
+            databaseUsage: '0 KB (No database files or image binaries stored)',
+            heapUsedMB: Math.round((mem.heapUsed / (1024 * 1024)) * 100) / 100,
+            rssMB: Math.round((mem.rss / (1024 * 1024)) * 100) / 100
+        }
     });
 });
 
@@ -345,20 +353,35 @@ app.post('/send', async (req, res) => {
     const destination = targetJid || TARGET_JID;
     console.log(`\n📨 [Outbound Request] Destination: ${destination}, Has Image: ${!!imageUrl}`);
 
-    // If imageUrl is provided, attempt to download image into Buffer
+    // If imageUrl is provided, attempt to download image into transient memory Buffer (Max 5MB guard)
     let imageBuffer = null;
     if (imageUrl) {
         try {
             console.log(`📥 Downloading image for WhatsApp: ${imageUrl}`);
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 12000);
+
             const imgRes = await fetch(imageUrl, {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
+                },
+                signal: controller.signal
             });
+            clearTimeout(timeoutId);
+
             if (imgRes.ok) {
-                const arrayBuf = await imgRes.arrayBuffer();
-                imageBuffer = Buffer.from(arrayBuf);
-                console.log(`✅ Image downloaded successfully (${imageBuffer.length} bytes)`);
+                const contentLength = parseInt(imgRes.headers.get('content-length') || '0', 10);
+                if (contentLength > 5 * 1024 * 1024) {
+                    console.warn(`Image exceeds 5MB limit (${contentLength} bytes). Skipping media buffer to protect RAM.`);
+                } else {
+                    const arrayBuf = await imgRes.arrayBuffer();
+                    if (arrayBuf.byteLength > 5 * 1024 * 1024) {
+                        console.warn(`Image payload exceeds 5MB (${arrayBuf.byteLength} bytes). Skipping to protect RAM.`);
+                    } else {
+                        imageBuffer = Buffer.from(arrayBuf);
+                        console.log(`✅ Image buffered in transient RAM (${imageBuffer.length} bytes) - 0 bytes on disk/DB`);
+                    }
+                }
             } else {
                 console.warn(`Failed to download image (${imageUrl}): HTTP ${imgRes.status}`);
             }
