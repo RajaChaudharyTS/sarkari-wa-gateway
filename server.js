@@ -13,6 +13,7 @@ const QRCode = require('qrcode');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -346,6 +347,76 @@ app.get('/newsletter-meta', async (req, res) => {
     }
 });
 
+
+/**
+ * Safe Base64URL encoding for WhatsApp CDN tokens
+ */
+function encodeBase64Url(buffer) {
+    return buffer.toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+}
+
+/**
+ * Uploads unencrypted media buffer directly to WhatsApp Newsletter CDN (/newsletter/newsletter-image)
+ * Generates verified /m1/ directPath required by WhatsApp Channels
+ */
+async function uploadNewsletterImage(waSocket, buffer) {
+    if (!waSocket || typeof waSocket.refreshMediaConn !== 'function') {
+        throw new Error('Socket not ready for media upload');
+    }
+
+    const fileSha256 = crypto.createHash('sha256').update(buffer).digest();
+    const token = encodeURIComponent(encodeBase64Url(fileSha256));
+
+    console.log('🔄 Refreshing WhatsApp media connection for newsletter upload...');
+    const mediaConn = await waSocket.refreshMediaConn(false);
+    const auth = encodeURIComponent(mediaConn.auth);
+
+    let lastErr = null;
+    const hosts = mediaConn.hosts || [];
+    for (const host of hosts) {
+        const hostname = host.hostname;
+        const uploadUrl = `https://${hostname}/newsletter/newsletter-image/${token}?auth=${auth}&token=${token}&server_thumb_gen=1`;
+        try {
+            console.log(`📡 Uploading unencrypted banner to WhatsApp CDN: https://${hostname}...`);
+            const res = await fetch(uploadUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/octet-stream',
+                    'Origin': 'https://web.whatsapp.com',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                },
+                body: buffer
+            });
+
+            if (res.ok) {
+                const data = await res.json();
+                console.log('✅ WhatsApp Newsletter CDN upload success:', JSON.stringify(data));
+                const directPath = data.direct_path || data.directPath;
+                if (data.url || directPath) {
+                    return {
+                        url: data.url,
+                        directPath: directPath,
+                        fileSha256: fileSha256,
+                        fileLength: buffer.length
+                    };
+                }
+            } else {
+                const errText = await res.text();
+                console.warn(`Upload to ${hostname} failed HTTP ${res.status}:`, errText);
+                lastErr = new Error(`HTTP ${res.status}: ${errText}`);
+            }
+        } catch (e) {
+            console.warn(`Upload error on ${hostname}:`, e.message);
+            lastErr = e;
+        }
+    }
+
+    throw new Error(`Newsletter CDN upload failed: ${lastErr ? lastErr.message : 'No responsive hosts'}`);
+}
+
 // 5. Send Alert (Supports both Newsletters and Regular Chats)
 app.post('/send', async (req, res) => {
     const authHeader = req.headers.authorization;
@@ -416,7 +487,7 @@ app.post('/send', async (req, res) => {
         if (fs.existsSync(localPath)) {
             try {
                 imageBuffer = fs.readFileSync(localPath);
-                console.log(`Using local fallback banner:  ( bytes)`);
+                console.log(`Using local fallback banner: ${fallbackBanner} (${imageBuffer.length} bytes)`);
             } catch (e) {
                 console.warn('Error reading local fallback banner:', e.message);
             }
@@ -427,25 +498,58 @@ app.post('/send', async (req, res) => {
     if (destination.endsWith('@newsletter')) {
         let lastErr = null;
 
-        // Priority 1: High-Level sock.sendMessage with Media for Newsletter
-        // Baileys natively handles raw unencrypted newsletter media upload, dimensions, and type: 'text' newsletter stanza!
+        // Priority 1: True WhatsApp Newsletter Native Media Upload (/newsletter/newsletter-image with /m1/ directPath)
         if (imageBuffer) {
             try {
-                console.log('Attempting Priority 1: sock.sendMessage with image to Newsletter...');
-                const sendRes = await sock.sendMessage(destination, {
-                    image: imageBuffer,
+                console.log('Attempting Priority 1: Native Newsletter Image Upload to WhatsApp CDN (/m1/)...');
+                const mediaData = await uploadNewsletterImage(sock, imageBuffer);
+                console.log('✅ CDN Upload Succeeded! directPath:', mediaData.directPath);
+
+                const imageMessage = {
+                    url: mediaData.url,
+                    directPath: mediaData.directPath,
+                    fileSha256: mediaData.fileSha256,
+                    fileLength: mediaData.fileLength,
+                    mimetype: 'image/jpeg',
                     caption: text || ''
-                });
-                console.log('Priority 1 (sendMessage with image) succeeded! Key:', JSON.stringify(sendRes?.key));
+                };
+
+                const encoded = proto.Message.encode({ imageMessage }).finish();
+                const msgId = generateMessageIDV2(sock.user?.id);
+                const stanza = {
+                    tag: 'message',
+                    attrs: {
+                        to: destination,
+                        id: msgId,
+                        type: 'text'
+                    },
+                    content: [{
+                        tag: 'plaintext',
+                        attrs: {},
+                        content: encoded
+                    }]
+                };
+
+                console.log('📡 Sending newsletter image stanza with query ACK...');
+                let queryRes = null;
+                try {
+                    queryRes = await sock.query(stanza);
+                    console.log('✅ Priority 1 Success (Server ACK received):', JSON.stringify(queryRes));
+                } catch (qErr) {
+                    console.warn('sock.query note:', qErr.message, 'attempting relayMessage fallback...');
+                    await sock.relayMessage(destination, { imageMessage }, { messageId: msgId });
+                }
+
                 return res.json({
                     status: 'success',
-                    method: 'sendMessage_image',
+                    method: 'newsletter_media_direct',
                     destination,
-                    messageId: sendRes?.key?.id,
-                    response: sendRes
+                    messageId: msgId,
+                    directPath: mediaData.directPath,
+                    response: queryRes
                 });
             } catch (imgErr) {
-                console.warn('Priority 1 (sendMessage image) failed, falling back to plaintext:', imgErr.message);
+                console.warn('Priority 1 (Native newsletter image) failed:', imgErr.message, 'falling back to plaintext...');
                 lastErr = imgErr;
             }
         }
@@ -555,6 +659,53 @@ app.get('/test-channel', async (req, res) => {
         } catch (e) {
             res.status(500).json({ error: err.message, fallbackError: e.message });
         }
+    }
+});
+
+
+// Quick Test Route with Photo
+app.get('/test-photo', async (req, res) => {
+    if (!isConnected || !sock) return res.status(503).json({ error: 'WhatsApp not connected' });
+    const text = req.query.text || '🟢 *Sarkari Result Test Alert with Photo Banner*\n\n💼 *Post Name:* Test Govt Vacancy 2026\n🏛️ *Vacancies:* 500+ Posts\n\n🔗 *Official Link:* https://www.sarkariresult.com';
+    const localPath = path.join(__dirname, 'banners', 'latest_job.png');
+    if (!fs.existsSync(localPath)) {
+        return res.status(500).json({ error: 'Local banner not found' });
+    }
+    const buffer = fs.readFileSync(localPath);
+    try {
+        const mediaData = await uploadNewsletterImage(sock, buffer);
+        const imageMessage = {
+            url: mediaData.url,
+            directPath: mediaData.directPath,
+            fileSha256: mediaData.fileSha256,
+            fileLength: mediaData.fileLength,
+            mimetype: 'image/jpeg',
+            caption: text
+        };
+        const encoded = proto.Message.encode({ imageMessage }).finish();
+        const msgId = generateMessageIDV2(sock.user?.id);
+        const stanza = {
+            tag: 'message',
+            attrs: {
+                to: TARGET_JID,
+                id: msgId,
+                type: 'text'
+            },
+            content: [{
+                tag: 'plaintext',
+                attrs: {},
+                content: encoded
+            }]
+        };
+        const queryRes = await sock.query(stanza);
+        res.json({
+            status: 'success',
+            directPath: mediaData.directPath,
+            messageId: msgId,
+            response: queryRes
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
