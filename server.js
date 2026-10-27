@@ -15,7 +15,7 @@ const path = require('path');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 10000;
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET || 'sarkari_secret_token_2026';
@@ -110,7 +110,7 @@ async function connectToWhatsApp() {
             version,
             auth: state,
             printQRInTerminal: false,
-            logger: pino({ level: 'info' }),
+            logger: pino({ level: 'warn' }),
             browser: Browsers.windows('Chrome'),
             syncFullHistory: false,
             connectTimeoutMs: 60000,
@@ -163,6 +163,8 @@ async function connectToWhatsApp() {
                 currentQrString = null;
                 connectedUser = sock.user;
                 lastError = null;
+                // Reset reconnection backoff on successful connect
+                connectToWhatsApp._backoff = 5000;
                 console.log('====================================================');
                 console.log(`🎉 WHATSAPP CONNECTED! User: ${sock.user?.id || 'Unknown'}`);
                 console.log(`📢 Default Target Channel JID: ${TARGET_JID}`);
@@ -188,9 +190,18 @@ async function connectToWhatsApp() {
         return sock;
     } catch (err) {
         console.error('Initialization error:', err.message);
-        setTimeout(connectToWhatsApp, 5000);
+        // Exponential backoff: 5s, 10s, 20s, 40s, max 5 min
+        if (!connectToWhatsApp._backoff) connectToWhatsApp._backoff = 5000;
+        const delay = connectToWhatsApp._backoff;
+        console.log(`Retrying in ${delay / 1000}s...`);
+        setTimeout(() => {
+            connectToWhatsApp._backoff = Math.min(delay * 2, 300000);
+            connectToWhatsApp();
+        }, delay);
     }
 }
+
+// Reset backoff on successful connection (called from connection.update 'open')
 
 // -------------------------------------------------------------
 // ROUTES
@@ -525,7 +536,23 @@ app.get('/test-channel', async (req, res) => {
 });
 
 // Start Server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`🚀 Sarkari WhatsApp Gateway listening on port ${PORT}`);
     connectToWhatsApp();
+});
+
+// Graceful shutdown handler (Render sends SIGTERM before killing)
+process.on('SIGTERM', async () => {
+    console.log('⚠️ SIGTERM received. Backing up session and shutting down gracefully...');
+    try {
+        await backupSessionToCloud();
+    } catch (e) {
+        console.error('Shutdown backup error:', e.message);
+    }
+    server.close(() => {
+        console.log('Server closed gracefully.');
+        process.exit(0);
+    });
+    // Force exit after 10s if graceful close hangs
+    setTimeout(() => process.exit(0), 10000);
 });
