@@ -402,51 +402,50 @@ app.post('/send', async (req, res) => {
         }
     }
 
+    // Local Fallback: If imageBuffer is null, automatically use bundled high-res category banner
+    if (!imageBuffer) {
+        const textSample = (text || '').toLowerCase();
+        let fallbackBanner = 'latest_job.png';
+        if (textSample.includes('admit card')) fallbackBanner = 'admit_card.png';
+        else if (textSample.includes('result') || textSample.includes('cut off') || textSample.includes('cutoff') || textSample.includes('merit')) fallbackBanner = 'result.png';
+        else if (textSample.includes('answer key')) fallbackBanner = 'answer_key.png';
+        else if (textSample.includes('admission')) fallbackBanner = 'admission.png';
+        else if (textSample.includes('weekly mega digest') || textSample.includes('hafte ki sabhi')) fallbackBanner = 'weekly_digest.png';
+
+        const localPath = path.join(__dirname, 'banners', fallbackBanner);
+        if (fs.existsSync(localPath)) {
+            try {
+                imageBuffer = fs.readFileSync(localPath);
+                console.log(`Using local fallback banner:  ( bytes)`);
+            } catch (e) {
+                console.warn('Error reading local fallback banner:', e.message);
+            }
+        }
+    }
+
     // SPECIAL HANDLING FOR WHATSAPP NEWSLETTER (CHANNEL)
     if (destination.endsWith('@newsletter')) {
         let lastErr = null;
 
-        // Priority 1: If image is available, attempt Newsletter Media Query with Server ACK validation
+        // Priority 1: High-Level sock.sendMessage with Media for Newsletter
+        // Baileys natively handles raw unencrypted newsletter media upload, dimensions, and type: 'text' newsletter stanza!
         if (imageBuffer) {
             try {
-                console.log('Attempting Newsletter Media Query with Server ACK...');
-                const media = await prepareWAMessageMedia({ image: imageBuffer }, { upload: sock.waUploadToServer });
-                const encoded = proto.Message.encode({
-                    imageMessage: {
-                        ...media.imageMessage,
-                        caption: text || ''
-                    }
-                }).finish();
-                const msgId = generateMessageIDV2(sock.user?.id);
-                const stanza = {
-                    tag: 'message',
-                    attrs: {
-                        to: destination,
-                        id: msgId,
-                        type: 'media'
-                    },
-                    content: [{
-                        tag: 'plaintext',
-                        attrs: {},
-                        content: encoded
-                    }]
-                };
-
-                const queryRes = await sock.query(stanza);
-                console.log('Newsletter Media Query Result:', JSON.stringify(queryRes));
-                if (queryRes?.tag === 'ack' && queryRes?.attrs?.server_id) {
-                    console.log(`✅ Newsletter Media delivered with Server ID: ${queryRes.attrs.server_id}`);
-                    return res.json({
-                        status: 'success',
-                        method: 'newsletter_media_query',
-                        destination,
-                        messageId: msgId,
-                        response: queryRes
-                    });
-                }
-                console.warn('Newsletter media query returned non-ack, falling back to plaintext:', queryRes);
+                console.log('Attempting Priority 1: sock.sendMessage with image to Newsletter...');
+                const sendRes = await sock.sendMessage(destination, {
+                    image: imageBuffer,
+                    caption: text || ''
+                });
+                console.log('Priority 1 (sendMessage with image) succeeded! Key:', JSON.stringify(sendRes?.key));
+                return res.json({
+                    status: 'success',
+                    method: 'sendMessage_image',
+                    destination,
+                    messageId: sendRes?.key?.id,
+                    response: sendRes
+                });
             } catch (imgErr) {
-                console.warn('Newsletter media query failed, falling back to plaintext:', imgErr.message);
+                console.warn('Priority 1 (sendMessage image) failed, falling back to plaintext:', imgErr.message);
                 lastErr = imgErr;
             }
         }
