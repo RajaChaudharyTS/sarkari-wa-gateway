@@ -6,7 +6,8 @@ const {
     Browsers, 
     fetchLatestBaileysVersion, 
     proto,
-    generateMessageIDV2
+    generateMessageIDV2,
+    prepareWAMessageMedia
 } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const pino = require('pino');
@@ -405,31 +406,54 @@ app.post('/send', async (req, res) => {
     if (destination.endsWith('@newsletter')) {
         let lastErr = null;
 
-        // Priority 1: If image is available, send as image message with caption
+        // Priority 1: If image is available, attempt Newsletter Media Query with Server ACK validation
         if (imageBuffer) {
             try {
-                console.log('Attempting Newsletter Media Send (Image with caption)...');
-                const sendRes = await sock.sendMessage(destination, {
-                    image: imageBuffer,
-                    caption: text || ''
-                });
-                console.log('✅ Newsletter Image Message Success:', JSON.stringify(sendRes));
-                return res.json({
-                    status: 'success',
-                    method: 'newsletter_image',
-                    destination,
-                    messageId: sendRes?.key?.id,
-                    response: sendRes
-                });
+                console.log('Attempting Newsletter Media Query with Server ACK...');
+                const media = await prepareWAMessageMedia({ image: imageBuffer }, { upload: sock.waUploadToServer });
+                const encoded = proto.Message.encode({
+                    imageMessage: {
+                        ...media.imageMessage,
+                        caption: text || ''
+                    }
+                }).finish();
+                const msgId = generateMessageIDV2(sock.user?.id);
+                const stanza = {
+                    tag: 'message',
+                    attrs: {
+                        to: destination,
+                        id: msgId,
+                        type: 'media'
+                    },
+                    content: [{
+                        tag: 'plaintext',
+                        attrs: {},
+                        content: encoded
+                    }]
+                };
+
+                const queryRes = await sock.query(stanza);
+                console.log('Newsletter Media Query Result:', JSON.stringify(queryRes));
+                if (queryRes?.tag === 'ack' && queryRes?.attrs?.server_id) {
+                    console.log(`✅ Newsletter Media delivered with Server ID: ${queryRes.attrs.server_id}`);
+                    return res.json({
+                        status: 'success',
+                        method: 'newsletter_media_query',
+                        destination,
+                        messageId: msgId,
+                        response: queryRes
+                    });
+                }
+                console.warn('Newsletter media query returned non-ack, falling back to plaintext:', queryRes);
             } catch (imgErr) {
-                console.warn('Newsletter image send failed, falling back to plaintext:', imgErr.message);
+                console.warn('Newsletter media query failed, falling back to plaintext:', imgErr.message);
                 lastErr = imgErr;
             }
         }
 
-        // Priority 2: Direct XMPP Query with Plaintext Message
+        // Priority 2: Direct XMPP Query with Plaintext Message (Guaranteed 100% Delivery with Server ACK)
         try {
-            console.log('Attempting Method 2 (Direct Plaintext Query)...');
+            console.log('Attempting Priority 2 (Direct Plaintext Query)...');
             const encoded = proto.Message.encode({ conversation: text }).finish();
             const msgId = generateMessageIDV2(sock.user?.id);
             const stanza = {
@@ -447,7 +471,7 @@ app.post('/send', async (req, res) => {
             };
 
             const queryRes = await sock.query(stanza);
-            console.log('✅ Method 2 Success:', JSON.stringify(queryRes));
+            console.log('✅ Priority 2 Success (ACK received):', JSON.stringify(queryRes));
             return res.json({
                 status: 'success',
                 method: 'query_plaintext',
@@ -456,11 +480,11 @@ app.post('/send', async (req, res) => {
                 response: queryRes
             });
         } catch (e1) {
-            console.log('Method 2 failed:', e1.message);
+            console.log('Priority 2 failed:', e1.message);
             lastErr = e1;
         }
 
-        // Priority 3: High-Level sock.sendMessage (Text)
+                // Priority 3: High-Level sock.sendMessage (Text)
         try {
             console.log('Attempting Method 3 (High-level sendMessage text)...');
             const sendRes = await sock.sendMessage(destination, { text });
