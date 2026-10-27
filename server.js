@@ -487,7 +487,7 @@ app.post('/send', async (req, res) => {
         if (fs.existsSync(localPath)) {
             try {
                 imageBuffer = fs.readFileSync(localPath);
-                console.log(`Using local fallback banner: ${fallbackBanner} (${imageBuffer.length} bytes)`);
+                console.log(`Using official Sarkari Result fallback banner: ${fallbackBanner} (${imageBuffer.length} bytes)`);
             } catch (e) {
                 console.warn('Error reading local fallback banner:', e.message);
             }
