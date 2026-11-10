@@ -340,10 +340,43 @@ app.get('/newsletter-meta', async (req, res) => {
     if (!sock || !isConnected) return res.status(503).json({ error: 'Not connected' });
     try {
         const code = req.query.code || '0029VbDyzTz9RZAPvqZL7542';
-        const meta = await sock.newsletterMetadata('invite', code);
-        res.json(meta);
+        if (typeof sock.newsletterMetadata === 'function') {
+            const meta = await sock.newsletterMetadata('invite', code);
+            return res.json(meta);
+        }
+        // Direct MEX query fallback
+        const result = await sock.query({
+            tag: 'iq',
+            attrs: {
+                id: sock.generateMessageTag(),
+                type: 'get',
+                to: 's.whatsapp.net',
+                xmlns: 'w:mex'
+            },
+            content: [
+                {
+                    tag: 'query',
+                    attrs: { query_id: '6563316087068696' },
+                    content: Buffer.from(JSON.stringify({
+                        variables: {
+                            input: { key: code, type: 'INVITE' },
+                            fetch_creation_time: true,
+                            fetch_full_image: true,
+                            fetch_viewer_metadata: true
+                        }
+                    }), 'utf-8')
+                }
+            ]
+        });
+        const resultNode = result.content?.find(c => c.tag === 'result');
+        if (resultNode && resultNode.content) {
+            const parsed = JSON.parse(resultNode.content.toString());
+            const meta = parsed.data?.xwa2_newsletter || parsed;
+            return res.json(meta);
+        }
+        res.json({ result });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: e.message, stack: e.stack });
     }
 });
 
