@@ -506,8 +506,10 @@ app.post('/send', async (req, res) => {
         }
     }
 
-    // Local Fallback: If imageBuffer is null, automatically use bundled high-res category banner
-    if (!imageBuffer) {
+    // Local Fallback: ONLY use Sarkari Result banners if target is the Sarkari Result channel!
+    // Non-Sarkari channels (e.g. AndroModApps, Canada Deals) MUST NEVER receive Sarkari banners.
+    const isSarkariChannel = (destination === TARGET_JID || destination === '120363429584632967@newsletter');
+    if (!imageBuffer && isSarkariChannel) {
         const textSample = (text || '').toLowerCase();
         let fallbackBanner = 'latest_job.png';
         if (textSample.includes('admit card')) fallbackBanner = 'admit_card.png';
